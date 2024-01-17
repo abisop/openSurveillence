@@ -1,0 +1,170 @@
+import random
+import numpy as np
+import tensorflow as tf
+import os
+import glob
+import matplotlib.pyplot as plt
+import argparse
+import time
+import mlflow
+import json
+
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from models import convlstm_model, LRCN_model
+from keras.preprocessing.image import ImageDataGenerator
+from utils import VideoFrameGenerator, save_model_ext
+
+
+seed_constant = 27
+np.random.seed(seed_constant)
+random.seed(seed_constant)
+tf.random.set_seed(seed_constant)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-i", "--dataset", type=str, required=True,
+                help="path to csv Data")
+# Specify the number of frames of a video that will be fed to the model as one sequence.
+ap.add_argument("-l", "--seq_len", type=int, default=20,
+                help="length of Sequence")
+
+ap.add_argument("-s", "--size", type=int, default=64,
+                help="Specify the height and width to which each video frame will be resized in our dataset.")
+ap.add_argument("-m", "--model", type=str,  default='LRCN',
+                choices=['convLSTM', 'LRCN'],
+                help="select model type convLSTM or LRCN")
+ap.add_argument("-e", "--epochs", type=int, default=70,
+                help="number of epochs")
+ap.add_argument("-b", "--batch_size", type=int, default=4,
+                help="number of batch_size")
+
+args = vars(ap.parse_args())
+DATASET_DIR = args["dataset"]
+SEQUENCE_LENGTH = args["seq_len"]
+IMAGE_SIZE = args["size"]
+model_type = args["model"]
+epochs = args["epochs"]
+batch_size = args["batch_size"]
+
+# some global params
+SIZE = (IMAGE_SIZE, IMAGE_SIZE)
+CHANNELS = 3
+n = 0
+
+# pattern to get videos and classes
+glob_pattern= DATASET_DIR + '/{classname}/*'
+
+# Data Extraction Start
+s_time = time.time()
+
+# Specify the list containing the names of the classes used for training. Feel free to choose any set of classes.
+CLASSES_LIST = sorted(os.listdir(DATASET_DIR))
+labels_string = json.dumps(CLASSES_LIST + [SEQUENCE_LENGTH, IMAGE_SIZE])
+
+# for data augmentation
+preprocessor = ImageDataGenerator(
+    rotation_range=10,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    horizontal_flip=True
+)
+
+# Create video frame generator
+train_gen = VideoFrameGenerator(
+    classes=CLASSES_LIST, 
+    glob_pattern=glob_pattern,
+    nb_frames=SEQUENCE_LENGTH,
+    split=.1, 
+    shuffle=True,
+    batch_size=batch_size,
+    target_shape=SIZE,
+    nb_channel=CHANNELS,
+    transformation=preprocessor,
+    use_frame_cache=False
+)
+
+# Validation Generator
+valid_gen = train_gen.get_validation_generator()
+
+# Data Size
+train_size = int(train_gen.files_count)
+val_size = int(valid_gen.files_count)
+total_data = train_size + val_size
+
+# Model Selection
+if model_type == 'convLSTM':
+    print("\33[5;30;43m [INFO] Selected convLSTM Model \33[0m")
+    model = convlstm_model(SEQUENCE_LENGTH, IMAGE_SIZE, CLASSES_LIST)
+    print("\33[1;37;42m [INFO] convLSTM Created Successfully \33[0m")
+elif model_type == 'LRCN':
+    print("\33[5;30;43m [INFO] Selected LRCN Model \33[0m")
+    model = LRCN_model(SEQUENCE_LENGTH, IMAGE_SIZE, CLASSES_LIST)
+    print("\33[1;37;42m [INFO] LRCN Created Successfully \33[0m")
+else:
+    print('\33[91m [INFO] Model NOT Choosen!! \33[0m')
+
+# Model Dir
+while True:
+    path_to_model_dir = f'runs/train/{model_type}{n}'
+    if not os.path.isdir(path_to_model_dir):
+        os.makedirs(path_to_model_dir, exist_ok=True)
+        print(f'\33[92m [INFO] Created {path_to_model_dir} Folder \33[0m')
+        break
+    else:
+        n += 1
+
+png_name = f'{model_type}_model_str.png'
+path_to_model_str = os.path.join(path_to_model_dir, png_name)
+
+
+# Create an Instance of Early Stopping Callback
+early_stopping_callback = EarlyStopping(
+    monitor='val_loss', patience=15, mode='min', restore_best_weights=True)
+
+# Model Checkpoint
+ckpt_path = os.path.join(path_to_model_dir, "weight-{epoch:02d}-{val_accuracy:.2f}.h5")
+checkpoint = ModelCheckpoint(
+    ckpt_path, monitor='val_accuracy',
+    verbose=1, save_best_only=False, mode='max'
+)
+
+# Compile the model and specify loss function, optimizer and metrics values to the model
+model.compile(loss='categorical_crossentropy',
+              optimizer='Adam', metrics=["accuracy"])
+
+print(f'\33[1;37;44m [INFO] {model_type} Model Training Started... \33[0m')
+
+# MLFlow
+mlflow.set_experiment('Action Recognition')
+with mlflow.start_run(run_name=f'{model_type}_model'):
+    mlflow.tensorflow.autolog()
+    # Start training the model.
+    history = model.fit(
+        train_gen,
+        validation_data=valid_gen,
+        batch_size=batch_size,
+        epochs=epochs,
+        callbacks=[early_stopping_callback, checkpoint]
+    )
+
+    print(f'\33[1;37;42m [INFO] Successfully Completed {model_type} Model Training \33[0m')
+
+    # Training End
+    te_time = time.time()
+    t2 = (te_time-s_time)/60
+    print(f'\33[5;30;46m [INFO] Model Training Completed in {round(t2, 2)} Minutes \33[0m')
+    
+    # Evaluate the trained model.
+    model_evaluation_history = model.evaluate(valid_gen)
+
+    # Get the loss and accuracy from model_evaluation_history.
+    model_evaluation_loss, model_evaluation_accuracy = model_evaluation_history
+
+    # Define a useful name for our model to make it easy for us while navigating through multiple saved models.
+    model_file_name = f'{model_type}_model_loss_{model_evaluation_loss:.3}_acc_{model_evaluation_accuracy:.3}.h5'
+
+    # Save your Model
+    path_to_save_model = os.path.join(path_to_model_dir, model_file_name)
+    # model.save(path_to_save_model)
+    # Saved model with class names
+    save_model_ext(model, path_to_save_model, meta_data=labels_string)
+    print(f'\33[1;37;42m [INFO] Model {model_file_name} saved Successfully.. \33[0m')
